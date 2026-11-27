@@ -1,6 +1,7 @@
-from httpx import AsyncClient
+from httpx import AsyncClient, HTTPStatusError, RequestError, TimeoutException
 from json import load as jload
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.logging import get_logger
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -56,6 +57,34 @@ def read_file_contents_tojson(filelocation: Path) -> list:
         return jload(f)
 
 
+def parse_code_in_range(value: int | str, name: str, minimum: int, maximum: int) -> int:
+    """
+    Converts an occupation code input to int and checks that it is in the range.
+    The error message tells the caller (the agent) what was wrong and what is allowed,
+    so that it can correct the input. FastMCP returns the message to the client
+    as a tool result with isError=True.
+    Args:
+        value (int | str): The input value. Can be "str" int, for example "2" or " 21 ".
+        name (str): Name of the tool argument, used in the error message.
+        minimum (int): Smallest allowed value.
+        maximum (int): Largest allowed value.
+    Raises:
+        ValueError: If the value is not an integer or is out of range.
+    Returns:
+        int: The value as int.
+    """
+    expected = f"{name} must be an integer from {minimum} to {maximum}"
+    if isinstance(value, bool):
+        raise ValueError(f"{expected}, got boolean {value!r}.")
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{expected}, got {value!r}.") from None
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{expected}, got {number}.")
+    return number
+
+
 @mcp.tool()
 def get_location_codes(first_letters_of_the_city: str) -> list:
     """Get location codes for the api call. Use text to narrow down the search (and to waste less context)
@@ -67,6 +96,11 @@ def get_location_codes(first_letters_of_the_city: str) -> list:
     """
     def normalise(text : str):
         return text.lower()
+
+    if not isinstance(first_letters_of_the_city, str):
+        raise TypeError(
+            f"first_letters_of_the_city must be a string, got {type(first_letters_of_the_city).__name__}."
+        )
     
     # In case of an empty input 
     if len(first_letters_of_the_city) < 1:
@@ -103,22 +137,17 @@ def get_medium_level_occupation_codes(high_level_code: int|str) -> list:
     Args:
         high_level_code (int | str): 1 min - 9 max. Can be "str" int. 
     Raises:
-        ValueError: Raises value error if the number does not fall within the range.
-        e: Except never to be excepted
+        ValueError: If the input is not an integer from 1 to 9. The message tells what was wrong.
     Returns:
         list: If the function does not raise an error, it will return a list. 
         The list will have items as long as the input list is not altered. 
     """
     
     try:
-        number = int(high_level_code)
-        if not 0 < number < 10 :
-            logger.error("Input error in get_medium_level_occupation_codes.")
-            raise ValueError
-        
-    except Exception as e:
-        logger.error(f"Something went wrong in get_medium_level_occupation_codes. {e}")
-        raise e
+        number = parse_code_in_range(high_level_code, name="high_level_code", minimum=1, maximum=9)
+    except ValueError as e:
+        logger.warning(f"get_medium_level_occupation_codes: invalid input. {e}")
+        raise
     
     codes = read_file_contents_tojson(OCCUPATIONS_MEDIUM_LEVEL_FILE)
     return_list = []
@@ -138,30 +167,25 @@ def get_low_level_occupation_codes(medium_level_code: int|str) -> list:
     Generally using these codes will result in lower amount of results from API call.
     Uses medium level code as a base criteria for the search.
     Args:
-        high_level_code (int | str): 10 min - 99 max. Can be "str" int. 
+        medium_level_code (int | str): 10 min - 99 max. Can be "str" int. 
     Raises:
-        ValueError: Raises value error if the number does not fall within the range.
-        e: Except never to be excepted
+        ValueError: If the input is not an integer from 10 to 99. The message tells what was wrong.
     Returns:
         list: If the function does not raise an error, it will return a list. 
         The list might be empty. 
     """
     
     try:
-        number = int(medium_level_code)
-        if not 9 < number < 100 :            
-            logger.error("Input error in get_low_level_occupation_codes.")
-            raise ValueError
-        
-    except Exception as e:
-        logger.error(f"Something went wrong in get_medium_level_occupation_codes. {e}")
-        raise e
+        number = parse_code_in_range(medium_level_code, name="medium_level_code", minimum=10, maximum=99)
+    except ValueError as e:
+        logger.warning(f"get_low_level_occupation_codes: invalid input. {e}")
+        raise
     
     
     codes = read_file_contents_tojson(OCCUPATIONS_LOW_LEVEL_FILE)
     return_list = []
     for i in codes:
-        if i["code"][:2] == str(medium_level_code):
+        if i["code"][:2] == str(number):
             return_list.append(i)
 
     return return_list
@@ -184,6 +208,9 @@ async def api_call(input: API_call):
             
     Notes:
     - Both fields default to empty lists.
+    Raises:
+        ToolError: If the API does not respond, returns an HTTP error, or returns data that is not JSON.
+        The message tells what went wrong.
     """
     
     def create_request(mun: List[str], isco: List[str]):
@@ -230,9 +257,20 @@ async def api_call(input: API_call):
             response.raise_for_status()
             return response.json()
 
-        except Exception as e:
-            logger.exception(f"API call failed: {e}")
-            return None
+        except TimeoutException as e:
+            logger.warning(f"API call timed out: {e!r}")
+            raise ToolError("Työmarkkinatori API did not respond in time. Try again later.") from e
+        except HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning(f"API call returned HTTP {status}: {e.response.text[:500]}")
+            raise ToolError(f"Työmarkkinatori API returned HTTP {status}. Check the municipality and occupation codes.") from e
+        except RequestError as e:
+            logger.warning(f"API call failed, network error: {e!r}")
+            raise ToolError(f"Could not connect to Työmarkkinatori API: {type(e).__name__}.") from e
+        except ValueError as e:
+            # response.json() raises a ValueError subclass if the body is not JSON
+            logger.warning(f"API returned a response that is not JSON: {e}")
+            raise ToolError("Työmarkkinatori API returned a response that is not valid JSON.") from e
 
 
 def main():
