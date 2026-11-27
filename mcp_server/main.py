@@ -57,32 +57,31 @@ def read_file_contents_tojson(filelocation: Path) -> list:
         return jload(f)
 
 
-def parse_code_in_range(value: int | str, name: str, minimum: int, maximum: int) -> int:
+def normalise_occupation_code(value: int|str, digits: int, name: str = "code") -> str:
     """
-    Converts an occupation code input to int and checks that it is in the range.
+    Returns an ISCO-08 occupation code as a string with exactly `digits` digits.
+    The codes for armed forces start with "0" ("0", "01", "011", "0110"), so a code
+    is a string, not a number. A shorter value gets leading zeros: 1 -> "01" when digits=2.
     The error message tells the caller (the agent) what was wrong and what is allowed,
     so that it can correct the input. FastMCP returns the message to the client
     as a tool result with isError=True.
     Args:
-        value (int | str): The input value. Can be "str" int, for example "2" or " 21 ".
-        name (str): Name of the tool argument, used in the error message.
-        minimum (int): Smallest allowed value.
-        maximum (int): Largest allowed value.
+        value (int | str): the code from the tool input.
+        digits (int): the number of digits that a code on this level has.
+        name (str): name of the tool argument, used in the error message.
     Raises:
-        ValueError: If the value is not an integer or is out of range.
+        ValueError: if the value is not 1 to `digits` digits.
     Returns:
-        int: The value as int.
+        str: the code with leading zeros.
     """
-    expected = f"{name} must be an integer from {minimum} to {maximum}"
-    if isinstance(value, bool):
-        raise ValueError(f"{expected}, got boolean {value!r}.")
-    try:
-        number = int(str(value).strip())
-    except (TypeError, ValueError):
-        raise ValueError(f"{expected}, got {value!r}.") from None
-    if not minimum <= number <= maximum:
-        raise ValueError(f"{expected}, got {number}.")
-    return number
+    code = str(value).strip()
+    if not (code.isascii() and code.isdigit()) or len(code) > digits:
+        raise ValueError(
+            f"{name} must be an occupation code with {digits} digit(s), "
+            f"for example {'1'.zfill(digits)!r}, got {value!r}. "
+            f"Give the code as a string to keep a leading zero."
+        )
+    return code.zfill(digits)
 
 
 @mcp.tool()
@@ -125,7 +124,7 @@ def get_all_high_level_occupation_codes() -> list:
     Returns:
         list: list that contains all high level occupation categories and the related codes. 
     """
-    return read_file_contents_tojson(OCCUPATIONS_LOW_LEVEL_FILE)
+    return read_file_contents_tojson(OCCUPATIONS_HIGH_LEVEL_FILE)
 
 
 @mcp.tool()
@@ -135,28 +134,23 @@ def get_medium_level_occupation_codes(high_level_code: int|str) -> list:
     Generally using these codes will result in medium amount of results. 
     Uses high level code as a base criteria for the search.
     Args:
-        high_level_code (int | str): 1 min - 9 max. Can be "str" int. 
+        high_level_code (int | str): one digit, "0" - "9". "0" is armed forces.
     Raises:
-        ValueError: If the input is not an integer from 1 to 9. The message tells what was wrong.
+        ValueError: If the input is not a code with one digit. The message tells what was wrong.
     Returns:
-        list: If the function does not raise an error, it will return a list. 
-        The list will have items as long as the input list is not altered. 
+        list: If the function does not raise an error, it will return a list.
+        Each code has two digits and starts with high_level_code, for example "01" or "21".
+        The list will have items as long as the input list is not altered.
     """
-    
+
     try:
-        number = parse_code_in_range(high_level_code, name="high_level_code", minimum=1, maximum=9)
+        code = normalise_occupation_code(high_level_code, digits=1, name="high_level_code")
     except ValueError as e:
         logger.warning(f"get_medium_level_occupation_codes: invalid input. {e}")
         raise
-    
-    codes = read_file_contents_tojson(OCCUPATIONS_MEDIUM_LEVEL_FILE)
-    return_list = []
-    
-    for i in codes:
-        if int(i["code"][:1]) == number:
-            return_list.append(i)
 
-    return return_list
+    codes = read_file_contents_tojson(OCCUPATIONS_MEDIUM_LEVEL_FILE)
+    return [i for i in codes if i["code"].startswith(code)]
 
 
 @mcp.tool()
@@ -167,33 +161,29 @@ def get_low_level_occupation_codes(medium_level_code: int|str) -> list:
     Generally using these codes will result in lower amount of results from API call.
     Uses medium level code as a base criteria for the search.
     Args:
-        medium_level_code (int | str): 10 min - 99 max. Can be "str" int. 
+        medium_level_code (int | str): two digits, for example "01" or "21".
+        Give it as a string to keep the leading zero. One digit gets a leading zero ("5" -> "05").
     Raises:
-        ValueError: If the input is not an integer from 10 to 99. The message tells what was wrong.
+        ValueError: If the code has more than two digits or is not a number. The message tells what was wrong.
     Returns:
-        list: If the function does not raise an error, it will return a list. 
-        The list might be empty. 
+        list: If the function does not raise an error, it will return a list.
+        Each code has three digits and starts with the medium level code, for example "011" or "211".
+        The list might be empty.
     """
-    
+
     try:
-        number = parse_code_in_range(medium_level_code, name="medium_level_code", minimum=10, maximum=99)
+        code = normalise_occupation_code(medium_level_code, digits=2, name="medium_level_code")
     except ValueError as e:
         logger.warning(f"get_low_level_occupation_codes: invalid input. {e}")
         raise
-    
-    
-    codes = read_file_contents_tojson(OCCUPATIONS_LOW_LEVEL_FILE)
-    return_list = []
-    for i in codes:
-        if i["code"][:2] == str(number):
-            return_list.append(i)
 
-    return return_list
+    codes = read_file_contents_tojson(OCCUPATIONS_LOW_LEVEL_FILE)
+    return [i for i in codes if i["code"].startswith(code)]
 
 
 class API_call(BaseModel):
     municipalities: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the municipality numbers.")
-    occupations: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the occupations numbers.")
+    occupations: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the occupation codes (ISCO-08, 1-4 digits) as strings. Keep the leading zero, for example \"021\".")
 
 
 @mcp.tool()

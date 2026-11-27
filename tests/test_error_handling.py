@@ -3,6 +3,7 @@ Tests for issue #4: error handling must not hide the real validation failure,
 and errors must reach the MCP client as clear tool errors (isError=True).
 """
 import logging
+import re
 from unittest.mock import patch
 
 import anyio
@@ -18,7 +19,7 @@ from mcp_server.main import (
     get_location_codes,
     get_low_level_occupation_codes,
     get_medium_level_occupation_codes,
-    parse_code_in_range,
+    normalise_occupation_code,
 )
 
 medium_mock_data = [
@@ -31,67 +32,77 @@ low_mock_data = [
 ]
 
 
-# parse_code_in_range
+# normalise_occupation_code: the error message names the argument, the format and the value
 
-@pytest.mark.parametrize("value, expected", [(1, 1), ("9", 9), (" 5 ", 5), (10, 10), ("99", 99)])
-def test_parse_code_in_range_valid(value, expected):
-    low, high = (1, 9) if expected < 10 else (10, 99)
-    assert parse_code_in_range(value, name="code", minimum=low, maximum=high) == expected
+HIGH_EXPECTED = "high_level_code must be an occupation code with 1 digit(s), for example '1'"
+MEDIUM_EXPECTED = "medium_level_code must be an occupation code with 2 digit(s), for example '01'"
+
+
+@pytest.mark.parametrize("value, digits, expected", [
+    (1, 1, "1"), ("9", 1, "9"), (" 5 ", 1, "5"), (0, 1, "0"),
+    (10, 2, "10"), ("99", 2, "99"), (1, 2, "01"), ("05", 2, "05"),
+])
+def test_normalise_occupation_code_valid(value, digits, expected):
+    assert normalise_occupation_code(value, digits=digits, name="code") == expected
 
 
 @pytest.mark.parametrize("value", ["abc", "", "2.5", None, [1]])
-def test_parse_code_in_range_not_integer_message(value):
+def test_normalise_occupation_code_not_a_code_message(value):
     with pytest.raises(ValueError) as excinfo:
-        parse_code_in_range(value, name="high_level_code", minimum=1, maximum=9)
+        normalise_occupation_code(value, digits=1, name="high_level_code")
     message = str(excinfo.value)
-    assert "high_level_code must be an integer from 1 to 9" in message
-    assert repr(value) in message
+    assert HIGH_EXPECTED in message
+    assert f"got {value!r}." in message
     # The low-level int() message must not leak through as the only explanation
     assert "invalid literal" not in message
 
 
-@pytest.mark.parametrize("value", [0, 10, -1, "120"])
-def test_parse_code_in_range_out_of_range_message(value):
+@pytest.mark.parametrize("value", [10, -1, "120", "01"])
+def test_normalise_occupation_code_full_message(value):
     with pytest.raises(ValueError) as excinfo:
-        parse_code_in_range(value, name="high_level_code", minimum=1, maximum=9)
-    assert str(excinfo.value) == f"high_level_code must be an integer from 1 to 9, got {int(value)}."
+        normalise_occupation_code(value, digits=1, name="high_level_code")
+    assert str(excinfo.value) == (
+        f"{HIGH_EXPECTED}, got {value!r}. Give the code as a string to keep a leading zero."
+    )
 
 
 @pytest.mark.parametrize("value", [True, False])
-def test_parse_code_in_range_rejects_bool(value):
-    with pytest.raises(ValueError, match="got boolean"):
-        parse_code_in_range(value, name="code", minimum=0, maximum=9)
+def test_normalise_occupation_code_rejects_bool(value):
+    with pytest.raises(ValueError, match=f"got {value!r}"):
+        normalise_occupation_code(value, digits=1, name="code")
 
 
 # Tool functions: error message is not empty and tells what is allowed
 
 def test_medium_level_out_of_range_message_not_empty():
     with patch("mcp_server.main.read_file_contents_tojson", return_value=medium_mock_data):
-        with pytest.raises(ValueError, match=r"high_level_code must be an integer from 1 to 9, got 120\."):
+        with pytest.raises(ValueError, match=re.escape(f"{HIGH_EXPECTED}, got 120.")):
             get_medium_level_occupation_codes(120)
 
 
-def test_medium_level_zero_rejected():
+def test_medium_level_two_digit_code_rejected():
+    # "0" is armed forces and is valid (issue #3). A two-digit code is not a high level code.
     with patch("mcp_server.main.read_file_contents_tojson", return_value=medium_mock_data):
-        with pytest.raises(ValueError, match="got 0"):
-            get_medium_level_occupation_codes(0)
+        with pytest.raises(ValueError, match="got '01'"):
+            get_medium_level_occupation_codes("01")
 
 
 def test_medium_level_non_numeric_message():
     with patch("mcp_server.main.read_file_contents_tojson", return_value=medium_mock_data):
-        with pytest.raises(ValueError, match=r"high_level_code must be an integer from 1 to 9, got 'abc'\."):
+        with pytest.raises(ValueError, match=re.escape(f"{HIGH_EXPECTED}, got 'abc'.")):
             get_medium_level_occupation_codes("abc")
 
 
 def test_low_level_out_of_range_message_not_empty():
     with patch("mcp_server.main.read_file_contents_tojson", return_value=low_mock_data):
-        with pytest.raises(ValueError, match=r"medium_level_code must be an integer from 10 to 99, got 9\."):
-            get_low_level_occupation_codes(9)
+        # 9 is valid now ("09"), so use a code with too many digits
+        with pytest.raises(ValueError, match=re.escape(f"{MEDIUM_EXPECTED}, got 120.")):
+            get_low_level_occupation_codes(120)
 
 
 def test_low_level_non_numeric_message():
     with patch("mcp_server.main.read_file_contents_tojson", return_value=low_mock_data):
-        with pytest.raises(ValueError, match=r"medium_level_code must be an integer from 10 to 99, got 'x1'\."):
+        with pytest.raises(ValueError, match=re.escape(f"{MEDIUM_EXPECTED}, got 'x1'.")):
             get_low_level_occupation_codes("x1")
 
 
@@ -106,7 +117,7 @@ def test_low_level_log_names_correct_function(caplog):
     with patch("mcp_server.main.read_file_contents_tojson", return_value=low_mock_data):
         with caplog.at_level(logging.WARNING):
             with pytest.raises(ValueError):
-                get_low_level_occupation_codes(5)
+                get_low_level_occupation_codes("abc")
     messages = [r.getMessage() for r in caplog.records]
     assert any("get_low_level_occupation_codes" in m for m in messages)
     assert not any("get_medium_level_occupation_codes" in m for m in messages)
@@ -218,13 +229,20 @@ def result_text(result) -> str:
 def test_mcp_client_gets_clear_error_for_out_of_range_medium_code():
     result = call_tool_via_client("get_medium_level_occupation_codes", {"high_level_code": 42})
     assert result.isError is True
-    assert "high_level_code must be an integer from 1 to 9, got 42." in result_text(result)
+    assert f"{HIGH_EXPECTED}, got 42." in result_text(result)
 
 
 def test_mcp_client_gets_clear_error_for_non_numeric_low_code():
     result = call_tool_via_client("get_low_level_occupation_codes", {"medium_level_code": "abc"})
     assert result.isError is True
-    assert "medium_level_code must be an integer from 10 to 99, got 'abc'." in result_text(result)
+    assert f"{MEDIUM_EXPECTED}, got 'abc'." in result_text(result)
+
+
+def test_mcp_client_armed_forces_group_is_not_error():
+    # Issue #3: "0" (armed forces) is a valid high level code
+    result = call_tool_via_client("get_medium_level_occupation_codes", {"high_level_code": "0"})
+    assert result.isError is False
+    assert "01" in result_text(result)
 
 
 def test_mcp_client_valid_call_is_not_error():

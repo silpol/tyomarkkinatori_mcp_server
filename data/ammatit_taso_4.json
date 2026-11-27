@@ -1,5 +1,17 @@
 [
     {
+        "code": "0110",
+        "preferredLabel": "Upseerit"
+    },
+    {
+        "code": "0210",
+        "preferredLabel": "Aliupseerit"
+    },
+    {
+        "code": "0310",
+        "preferredLabel": "Sotilasammattihenkilöstö"
+    },
+    {
         "code": "1111",
         "preferredLabel": "Lainsäätäjät"
     },
