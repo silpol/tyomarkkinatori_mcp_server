@@ -1,6 +1,7 @@
-from httpx import AsyncClient
+from httpx import AsyncClient, HTTPStatusError, RequestError, TimeoutException
 from json import load as jload
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.logging import get_logger
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -56,14 +57,18 @@ def read_file_contents_tojson(filelocation: Path) -> list:
         return jload(f)
 
 
-def normalise_occupation_code(value: int|str, digits: int) -> str:
+def normalise_occupation_code(value: int|str, digits: int, name: str = "code") -> str:
     """
     Returns an ISCO-08 occupation code as a string with exactly `digits` digits.
     The codes for armed forces start with "0" ("0", "01", "011", "0110"), so a code
     is a string, not a number. A shorter value gets leading zeros: 1 -> "01" when digits=2.
+    The error message tells the caller (the agent) what was wrong and what is allowed,
+    so that it can correct the input. FastMCP returns the message to the client
+    as a tool result with isError=True.
     Args:
         value (int | str): the code from the tool input.
         digits (int): the number of digits that a code on this level has.
+        name (str): name of the tool argument, used in the error message.
     Raises:
         ValueError: if the value is not 1 to `digits` digits.
     Returns:
@@ -72,8 +77,9 @@ def normalise_occupation_code(value: int|str, digits: int) -> str:
     code = str(value).strip()
     if not (code.isascii() and code.isdigit()) or len(code) > digits:
         raise ValueError(
-            f"Invalid occupation code {value!r}: expected a code with {digits} digit(s), "
-            f"for example {'1'.zfill(digits)!r}. Give the code as a string to keep a leading zero."
+            f"{name} must be an occupation code with {digits} digit(s), "
+            f"for example {'1'.zfill(digits)!r}, got {value!r}. "
+            f"Give the code as a string to keep a leading zero."
         )
     return code.zfill(digits)
 
@@ -89,6 +95,11 @@ def get_location_codes(first_letters_of_the_city: str) -> list:
     """
     def normalise(text : str):
         return text.lower()
+
+    if not isinstance(first_letters_of_the_city, str):
+        raise TypeError(
+            f"first_letters_of_the_city must be a string, got {type(first_letters_of_the_city).__name__}."
+        )
     
     # In case of an empty input 
     if len(first_letters_of_the_city) < 1:
@@ -125,8 +136,7 @@ def get_medium_level_occupation_codes(high_level_code: int|str) -> list:
     Args:
         high_level_code (int | str): one digit, "0" - "9". "0" is armed forces.
     Raises:
-        ValueError: Raises value error if the code is not one digit.
-        e: Except never to be excepted
+        ValueError: If the input is not a code with one digit. The message tells what was wrong.
     Returns:
         list: If the function does not raise an error, it will return a list.
         Each code has two digits and starts with high_level_code, for example "01" or "21".
@@ -134,11 +144,10 @@ def get_medium_level_occupation_codes(high_level_code: int|str) -> list:
     """
 
     try:
-        code = normalise_occupation_code(high_level_code, digits=1)
-
-    except Exception as e:
-        logger.error(f"Something went wrong in get_medium_level_occupation_codes. {e}")
-        raise e
+        code = normalise_occupation_code(high_level_code, digits=1, name="high_level_code")
+    except ValueError as e:
+        logger.warning(f"get_medium_level_occupation_codes: invalid input. {e}")
+        raise
 
     codes = read_file_contents_tojson(OCCUPATIONS_MEDIUM_LEVEL_FILE)
     return [i for i in codes if i["code"].startswith(code)]
@@ -155,8 +164,7 @@ def get_low_level_occupation_codes(medium_level_code: int|str) -> list:
         medium_level_code (int | str): two digits, for example "01" or "21".
         Give it as a string to keep the leading zero. One digit gets a leading zero ("5" -> "05").
     Raises:
-        ValueError: Raises value error if the code has more than two digits or is not a number.
-        e: Except never to be excepted
+        ValueError: If the code has more than two digits or is not a number. The message tells what was wrong.
     Returns:
         list: If the function does not raise an error, it will return a list.
         Each code has three digits and starts with the medium level code, for example "011" or "211".
@@ -164,12 +172,10 @@ def get_low_level_occupation_codes(medium_level_code: int|str) -> list:
     """
 
     try:
-        code = normalise_occupation_code(medium_level_code, digits=2)
-
-    except Exception as e:
-        logger.error(f"Something went wrong in get_medium_level_occupation_codes. {e}")
-        raise e
-
+        code = normalise_occupation_code(medium_level_code, digits=2, name="medium_level_code")
+    except ValueError as e:
+        logger.warning(f"get_low_level_occupation_codes: invalid input. {e}")
+        raise
 
     codes = read_file_contents_tojson(OCCUPATIONS_LOW_LEVEL_FILE)
     return [i for i in codes if i["code"].startswith(code)]
@@ -192,6 +198,9 @@ async def api_call(input: API_call):
             
     Notes:
     - Both fields default to empty lists.
+    Raises:
+        ToolError: If the API does not respond, returns an HTTP error, or returns data that is not JSON.
+        The message tells what went wrong.
     """
     
     def create_request(mun: List[str], isco: List[str]):
@@ -238,9 +247,20 @@ async def api_call(input: API_call):
             response.raise_for_status()
             return response.json()
 
-        except Exception as e:
-            logger.exception(f"API call failed: {e}")
-            return None
+        except TimeoutException as e:
+            logger.warning(f"API call timed out: {e!r}")
+            raise ToolError("Työmarkkinatori API did not respond in time. Try again later.") from e
+        except HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning(f"API call returned HTTP {status}: {e.response.text[:500]}")
+            raise ToolError(f"Työmarkkinatori API returned HTTP {status}. Check the municipality and occupation codes.") from e
+        except RequestError as e:
+            logger.warning(f"API call failed, network error: {e!r}")
+            raise ToolError(f"Could not connect to Työmarkkinatori API: {type(e).__name__}.") from e
+        except ValueError as e:
+            # response.json() raises a ValueError subclass if the body is not JSON
+            logger.warning(f"API returned a response that is not JSON: {e}")
+            raise ToolError("Työmarkkinatori API returned a response that is not valid JSON.") from e
 
 
 def main():
