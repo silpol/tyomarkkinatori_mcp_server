@@ -1,7 +1,6 @@
-from httpx import AsyncClient, HTTPStatusError, RequestError, TimeoutException
+from httpx import AsyncClient
 from json import load as jload
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.logging import get_logger
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -198,9 +197,6 @@ async def api_call(input: API_call):
             
     Notes:
     - Both fields default to empty lists.
-    Raises:
-        ToolError: If the API does not respond, returns an HTTP error, or returns data that is not JSON.
-        The message tells what went wrong.
     """
     
     def create_request(mun: List[str], isco: List[str]):
@@ -247,20 +243,9 @@ async def api_call(input: API_call):
             response.raise_for_status()
             return response.json()
 
-        except TimeoutException as e:
-            logger.warning(f"API call timed out: {e!r}")
-            raise ToolError("Työmarkkinatori API did not respond in time. Try again later.") from e
-        except HTTPStatusError as e:
-            status = e.response.status_code
-            logger.warning(f"API call returned HTTP {status}: {e.response.text[:500]}")
-            raise ToolError(f"Työmarkkinatori API returned HTTP {status}. Check the municipality and occupation codes.") from e
-        except RequestError as e:
-            logger.warning(f"API call failed, network error: {e!r}")
-            raise ToolError(f"Could not connect to Työmarkkinatori API: {type(e).__name__}.") from e
-        except ValueError as e:
-            # response.json() raises a ValueError subclass if the body is not JSON
-            logger.warning(f"API returned a response that is not JSON: {e}")
-            raise ToolError("Työmarkkinatori API returned a response that is not valid JSON.") from e
+        except Exception as e:
+            logger.exception(f"API call failed: {e}")
+            return None
 
 
 def main():

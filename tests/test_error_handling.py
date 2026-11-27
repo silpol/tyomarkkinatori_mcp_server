@@ -1,21 +1,18 @@
 """
 Tests for issue #4: error handling must not hide the real validation failure,
 and errors must reach the MCP client as clear tool errors (isError=True).
+The errors of api_call are tested in test_api_call.py (issue #5).
 """
 import logging
 import re
 from unittest.mock import patch
 
 import anyio
-import httpx
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from mcp_server import main
 from mcp_server.main import (
-    API_call,
-    api_call,
     get_location_codes,
     get_low_level_occupation_codes,
     get_medium_level_occupation_codes,
@@ -144,74 +141,6 @@ def test_file_errors_are_not_converted_to_value_error():
             get_medium_level_occupation_codes(2)
 
 
-# api_call: errors are raised as ToolError with a clear message, not returned as None
-
-def run_api_call_with_transport(handler, payload=None):
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
-
-    def client_factory(*args, **kwargs):
-        return real_client(transport=transport)
-
-    payload = payload or API_call(municipalities=[91], occupations=["2512"])
-    with patch("mcp_server.main.AsyncClient", side_effect=client_factory):
-        return anyio.run(api_call, payload)
-
-
-def test_api_call_success_returns_json_and_pads_municipality():
-    seen = {}
-
-    def handler(request: httpx.Request):
-        import json
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"content": [{"id": 1}]})
-
-    result = run_api_call_with_transport(handler)
-    assert result == {"content": [{"id": 1}]}
-    assert seen["body"]["filters"]["municipalities"] == ["091"]
-    assert seen["body"]["filters"]["iscoNotations"] == ["2512"]
-
-
-def test_api_call_http_error_raises_tool_error():
-    def handler(request):
-        return httpx.Response(400, text="bad request")
-
-    with pytest.raises(ToolError, match="returned HTTP 400"):
-        run_api_call_with_transport(handler)
-
-
-def test_api_call_server_error_raises_tool_error():
-    def handler(request):
-        return httpx.Response(503, text="unavailable")
-
-    with pytest.raises(ToolError, match="returned HTTP 503"):
-        run_api_call_with_transport(handler)
-
-
-def test_api_call_timeout_raises_tool_error():
-    def handler(request):
-        raise httpx.ReadTimeout("timed out", request=request)
-
-    with pytest.raises(ToolError, match="did not respond in time"):
-        run_api_call_with_transport(handler)
-
-
-def test_api_call_connection_error_raises_tool_error():
-    def handler(request):
-        raise httpx.ConnectError("name resolution failed", request=request)
-
-    with pytest.raises(ToolError, match="Could not connect to Työmarkkinatori API: ConnectError"):
-        run_api_call_with_transport(handler)
-
-
-def test_api_call_invalid_json_raises_tool_error():
-    def handler(request):
-        return httpx.Response(200, text="<html>not json</html>")
-
-    with pytest.raises(ToolError, match="not valid JSON"):
-        run_api_call_with_transport(handler)
-
-
 # End to end through an MCP client session: the agent gets isError=True and the clear message
 
 def call_tool_via_client(name: str, arguments: dict):
@@ -249,15 +178,3 @@ def test_mcp_client_valid_call_is_not_error():
     result = call_tool_via_client("get_medium_level_occupation_codes", {"high_level_code": 2})
     assert result.isError is False
     assert "21" in result_text(result)
-
-
-def test_mcp_client_gets_tool_error_for_api_failure():
-    def handler(request):
-        return httpx.Response(502)
-
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
-    with patch("mcp_server.main.AsyncClient", side_effect=lambda *a, **k: real_client(transport=transport)):
-        result = call_tool_via_client("api_call", {"input": {"municipalities": [91], "occupations": []}})
-    assert result.isError is True
-    assert "returned HTTP 502" in result_text(result)
