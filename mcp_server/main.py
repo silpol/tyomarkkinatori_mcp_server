@@ -4,7 +4,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.logging import get_logger
 from pathlib import Path
-from pydantic import BaseModel, Field
+from functools import lru_cache
+from pydantic import BaseModel, Field, field_validator
 from typing import List
 import logging
 
@@ -87,6 +88,50 @@ def normalise_occupation_code(value: int|str, digits: int, name: str = "code") -
     return code.zfill(digits)
 
 
+# Municipality codes of Statistics Finland ("Kunnat 2022" classification).
+# The Työmarkkinatori retrieval interface instructions (noutorajapintaohje.pdf,
+# chapters 5.1 and 7.7) use these codes for the municipality filter, for example
+# "837" for Tampere. A code always has three digits: Helsinki is "091", Akaa is "020".
+MUNICIPALITY_CODE_DIGITS = 3
+
+
+@lru_cache(maxsize=1)
+def known_municipality_codes() -> frozenset[str]:
+    """
+    Returns the set of valid municipality codes from the municipality file,
+    each as a three-digit string.
+    """
+    return frozenset(
+        str(i["code"]).strip().zfill(MUNICIPALITY_CODE_DIGITS)
+        for i in read_file_contents_tojson(MUNICIPALITIES_FILE)
+    )
+
+
+def normalise_municipality_code(value: int|str) -> str:
+    """
+    Returns a municipality code as a string with exactly three digits.
+    A shorter value gets leading zeros: 91 -> "091", "5" -> "005".
+    Args:
+        value (int | str): the code from the tool input.
+    Raises:
+        ValueError: if the value is not 1 to 3 digits, or if it is not a known municipality code.
+    Returns:
+        str: the code with leading zeros.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"municipality code must be a number or a string of digits, got {value!r}.")
+    code = str(value).strip()
+    if not (code.isascii() and code.isdigit()) or len(code) > MUNICIPALITY_CODE_DIGITS:
+        raise ValueError(
+            f"municipality code must have 1 to {MUNICIPALITY_CODE_DIGITS} digits, "
+            f"for example '091' for Helsinki, got {value!r}."
+        )
+    code = code.zfill(MUNICIPALITY_CODE_DIGITS)
+    if code not in known_municipality_codes():
+        raise ValueError(f"{value!r} is not a known municipality code.")
+    return code
+
+
 @mcp.tool()
 def get_location_codes(first_letters_of_the_city: str) -> list:
     """Get location codes for the api call. Use text to narrow down the search (and to waste less context)
@@ -94,7 +139,9 @@ def get_location_codes(first_letters_of_the_city: str) -> list:
     Args:
         first_letters_of_the_city (str): "Helsinki" or "Vaasa" or "Hel" or "Tur"... 
     Returns:
-        list: returns a list of the results. The list can be empty or contain JSON objects. 
+        list: returns a list of the results. The list can be empty or contain JSON objects.
+        Each object has "code" (Statistics Finland municipality code, 3 digits, for example "091")
+        and "classificationName". Give the "code" values to api_call.
     """
     def normalise(text : str):
         return text.lower()
@@ -221,8 +268,37 @@ def _truncate(text: str, max_chars: int = ERROR_BODY_MAX_CHARS) -> str:
 
 
 class API_call(BaseModel):
-    municipalities: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the municipality numbers.")
+    municipalities: list[int|str] = Field(
+        default=[], min_length=0, max_length=10,
+        description="list of the municipality codes from get_location_codes (Statistics Finland, "
+                    "3 digits, for example \"091\" for Helsinki). A shorter code gets leading zeros: 91 -> \"091\".")
     occupations: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the occupation codes (ISCO-08, 1-4 digits) as strings. Keep the leading zero, for example \"021\".")
+
+    @field_validator("municipalities", mode="before")
+    @classmethod
+    def reject_bool_municipalities(cls, value):
+        # Pydantic converts True to 1 before the "after" validator sees it.
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, bool):
+                    raise ValueError(f"municipality code must be a number or a string of digits, got {item!r}.")
+        return value
+
+    @field_validator("municipalities", mode="after")
+    @classmethod
+    def normalise_municipalities(cls, value: list[int|str]) -> list[str]:
+        codes, errors = [], []
+        for item in value:
+            try:
+                codes.append(normalise_municipality_code(item))
+            except ValueError as e:
+                errors.append(str(e))
+        if errors:
+            raise ValueError(
+                "invalid municipality code(s): " + " ".join(errors)
+                + " Use get_location_codes to find the codes."
+            )
+        return codes
 
 
 @mcp.tool()
@@ -247,16 +323,15 @@ async def api_call(input: API_call):
     """
     
     def create_request(mun: List[str], isco: List[str]):
-        def add_leading_zeros(value: str) -> str:
-            return value.zfill(3)
-
+        # The API_call model has already validated the municipality codes
+        # and changed them to three-digit strings.
         data = {
             "query": "",
             "paging": {"pageSize": 30, "pageNumber": 0},
             "filters": {
                 "publishedAfter": "",
                 "closesBefore": "",
-                "municipalities": [add_leading_zeros(m) for m in mun],
+                "municipalities": mun,
                 "iscoNotations": isco,
                 "regions": [],
                 "countries": [],
