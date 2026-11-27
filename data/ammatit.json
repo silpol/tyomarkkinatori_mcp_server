@@ -4,39 +4,39 @@
         "preferredLabel": "Sotilaat"
     },
     {
-        "code": "1",
+        "code": "01",
         "preferredLabel": "Upseerit"
     },
     {
-        "code": "11",
+        "code": "011",
         "preferredLabel": "Upseerit"
     },
     {
-        "code": "110",
+        "code": "0110",
         "preferredLabel": "Upseerit"
     },
     {
-        "code": "2",
+        "code": "02",
         "preferredLabel": "Aliupseerit"
     },
     {
-        "code": "21",
+        "code": "021",
         "preferredLabel": "Aliupseerit"
     },
     {
-        "code": "210",
+        "code": "0210",
         "preferredLabel": "Aliupseerit"
     },
     {
-        "code": "3",
+        "code": "03",
         "preferredLabel": "Sotilasammattihenkilöstö"
     },
     {
-        "code": "31",
+        "code": "031",
         "preferredLabel": "Sotilasammattihenkilöstö"
     },
     {
-        "code": "310",
+        "code": "0310",
         "preferredLabel": "Sotilasammattihenkilöstö"
     },
     {
