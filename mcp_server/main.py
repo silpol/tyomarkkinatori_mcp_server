@@ -10,6 +10,9 @@ import logging
 
 # CONSTANTS
 API_URL = "https://tyomarkkinatori.fi/api/jobpostingfulltext/search/v1/search"
+API_TIMEOUT_SECONDS = 5.0
+# Max characters of the API response body to include in an error message
+ERROR_BODY_MAX_CHARS = 500
 
 # PATHS
 OCCUPATIONS_HIGH_LEVEL_FILE = Path(__file__).resolve().parent.parent / "data" / "ammatit_taso_1.json"
@@ -181,6 +184,42 @@ def get_low_level_occupation_codes(medium_level_code: int|str) -> list:
     return [i for i in codes if i["code"].startswith(code)]
 
 
+class TyomarkkinatoriAPIError(ToolError):
+    """
+    Base class for errors from the Työmarkkinatori API call.
+    FastMCP sends the message of a raised exception to the MCP client
+    as a tool result with isError=True, so the message must tell the
+    client (LLM) what failed and what it can do.
+    """
+
+
+class APITimeoutError(TyomarkkinatoriAPIError):
+    """The API did not respond in time."""
+
+
+class APIHTTPStatusError(TyomarkkinatoriAPIError):
+    """The API responded with an HTTP error status (4xx or 5xx)."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class APINetworkError(TyomarkkinatoriAPIError):
+    """The request did not reach the API (DNS, connection, TLS...)."""
+
+
+class APIInvalidResponseError(TyomarkkinatoriAPIError):
+    """The API responded with a body that is not valid JSON."""
+
+
+def _truncate(text: str, max_chars: int = ERROR_BODY_MAX_CHARS) -> str:
+    text = text.strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + "... (truncated)"
+    return text
+
+
 class API_call(BaseModel):
     municipalities: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the municipality numbers.")
     occupations: list[int|str] = Field(default=[], min_length=0, max_length=10, description="list of the occupation codes (ISCO-08, 1-4 digits) as strings. Keep the leading zero, for example \"021\".")
@@ -198,9 +237,13 @@ async def api_call(input: API_call):
             
     Notes:
     - Both fields default to empty lists.
+
     Raises:
-        ToolError: If the API does not respond, returns an HTTP error, or returns data that is not JSON.
-        The message tells what went wrong.
+        APITimeoutError: The API did not respond in time. Retrying later can help.
+        APIHTTPStatusError: The API returned an HTTP error status.
+            4xx usually means the request (codes) is not valid; 5xx means a server-side problem.
+        APINetworkError: The API could not be reached.
+        APIInvalidResponseError: The API response is not valid JSON.
     """
     
     def create_request(mun: List[str], isco: List[str]):
@@ -227,40 +270,65 @@ async def api_call(input: API_call):
 
         return headers, data
 
+    municipalities_list = [str(m) for m in input.municipalities]
+    occupations_list = [str(o) for o in input.occupations]
+
+    headers, data = create_request(
+        mun=municipalities_list,
+        isco=occupations_list
+    )
+
     async with AsyncClient() as client:
         try:
-            municipalities_list = [str(m) for m in input.municipalities]
-            occupations_list = [str(o) for o in input.occupations]
-
-            headers, data = create_request(
-                mun=municipalities_list, 
-                isco=occupations_list
-            )
             logger.info('Sending request to API.')
             response = await client.post(
                 url=API_URL,
                 headers=headers,
                 json=data,
-                timeout=5.0
+                timeout=API_TIMEOUT_SECONDS
             )
             logger.info(f'Response {response.status_code}')
             response.raise_for_status()
-            return response.json()
 
+        # TimeoutException is a subclass of RequestError, so it must come first.
         except TimeoutException as e:
-            logger.warning(f"API call timed out: {e!r}")
-            raise ToolError("Työmarkkinatori API did not respond in time. Try again later.") from e
+            logger.exception(f"API call timed out: {e}")
+            raise APITimeoutError(
+                f"Työmarkkinatori API timeout: no response within {API_TIMEOUT_SECONDS} seconds "
+                f"({type(e).__name__}). The service can be slow or unavailable; try again later."
+            ) from e
+
         except HTTPStatusError as e:
             status = e.response.status_code
-            logger.warning(f"API call returned HTTP {status}: {e.response.text[:500]}")
-            raise ToolError(f"Työmarkkinatori API returned HTTP {status}. Check the municipality and occupation codes.") from e
+            body = _truncate(e.response.text)
+            logger.exception(f"API call returned HTTP {status}: {body}")
+            if 400 <= status < 500:
+                hint = ("The API did not accept the request. Check that the municipality codes "
+                        "and occupation codes are valid (use the code lookup tools).")
+            else:
+                hint = "The Työmarkkinatori service has a problem; try again later."
+            message = f"Työmarkkinatori API returned HTTP {status} {e.response.reason_phrase}. {hint}"
+            if body:
+                message += f" Response body: {body}"
+            raise APIHTTPStatusError(message, status_code=status) from e
+
         except RequestError as e:
-            logger.warning(f"API call failed, network error: {e!r}")
-            raise ToolError(f"Could not connect to Työmarkkinatori API: {type(e).__name__}.") from e
-        except ValueError as e:
-            # response.json() raises a ValueError subclass if the body is not JSON
-            logger.warning(f"API returned a response that is not JSON: {e}")
-            raise ToolError("Työmarkkinatori API returned a response that is not valid JSON.") from e
+            logger.exception(f"API call network error: {e}")
+            raise APINetworkError(
+                f"Työmarkkinatori API network error: could not reach {API_URL} "
+                f"({type(e).__name__}: {e}). Check the network connection and try again."
+            ) from e
+
+    try:
+        return response.json()
+    except ValueError as e:
+        # json.JSONDecodeError is a subclass of ValueError
+        body = _truncate(response.text)
+        logger.exception(f"API response is not valid JSON: {body}")
+        raise APIInvalidResponseError(
+            f"Työmarkkinatori API returned HTTP {response.status_code} with a response that is "
+            f"not valid JSON. Response body: {body}"
+        ) from e
 
 
 def main():
