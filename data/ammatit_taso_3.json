@@ -1,14 +1,14 @@
 [
     {
-        "code": "110",
+        "code": "011",
         "preferredLabel": "Upseerit"
     },
     {
-        "code": "210",
+        "code": "021",
         "preferredLabel": "Aliupseerit"
     },
     {
-        "code": "310",
+        "code": "031",
         "preferredLabel": "Sotilasammattihenkilöstö"
     },
     {
